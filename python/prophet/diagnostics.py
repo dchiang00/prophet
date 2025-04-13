@@ -304,6 +304,7 @@ def prophet_copy(m, cutoff=None):
         weekly_seasonality=False,
         daily_seasonality=False,
         holidays=m.holidays,
+        holidays_mode=m.holidays_mode,
         seasonality_mode=m.seasonality_mode,
         seasonality_prior_scale=m.seasonality_prior_scale,
         changepoint_prior_scale=m.changepoint_prior_scale,
@@ -320,6 +321,23 @@ def prophet_copy(m, cutoff=None):
     m2.seasonalities = deepcopy(m.seasonalities)
     m2.country_holidays = deepcopy(m.country_holidays)
     return m2
+
+
+PERFORMANCE_METRICS=dict()
+def register_performance_metric(func):
+    """Register custom performance metric
+
+    Parameters that your metric should contain
+    ----------
+    df: Cross-validation results dataframe.
+    w: Aggregation window size.
+
+    Registered metric should return following 
+    -------
+    Dataframe with columns horizon and metric.
+    """
+    PERFORMANCE_METRICS[func.__name__] = func
+    return func
 
 
 def performance_metrics(df, metrics=None, rolling_window=0.1, monthly=False):
@@ -376,7 +394,7 @@ def performance_metrics(df, metrics=None, rolling_window=0.1, monthly=False):
         metrics.remove('coverage')
     if len(set(metrics)) != len(metrics):
         raise ValueError('Input metrics must be a list of unique values')
-    if not set(metrics).issubset(set(valid_metrics)):
+    if not set(metrics).issubset(set(PERFORMANCE_METRICS)):
         raise ValueError(
             'Valid values for metrics are: {}'.format(valid_metrics)
         )
@@ -398,7 +416,7 @@ def performance_metrics(df, metrics=None, rolling_window=0.1, monthly=False):
     # Compute all metrics
     dfs = {}
     for metric in metrics:
-        dfs[metric] = eval(metric)(df_m, w)
+        dfs[metric] = PERFORMANCE_METRICS[metric](df_m, w)
     res = dfs[metrics[0]]
     for i in range(1, len(metrics)):
         res_m = dfs[metrics[i]]
@@ -517,6 +535,7 @@ def rolling_median_by_h(x, h, w, name):
 # as a dataframe, given a window size for rolling aggregation.
 
 
+@register_performance_metric
 def mse(df, w):
     """Mean squared error
 
@@ -537,6 +556,7 @@ def mse(df, w):
     )
 
 
+@register_performance_metric
 def rmse(df, w):
     """Root mean squared error
 
@@ -555,6 +575,7 @@ def rmse(df, w):
     return res
 
 
+@register_performance_metric
 def mae(df, w):
     """Mean absolute error
 
@@ -575,6 +596,7 @@ def mae(df, w):
     )
 
 
+@register_performance_metric
 def mape(df, w):
     """Mean absolute percent error
 
@@ -595,6 +617,7 @@ def mape(df, w):
     )
 
 
+@register_performance_metric
 def mdape(df, w):
     """Median absolute percent error
 
@@ -615,6 +638,7 @@ def mdape(df, w):
     )
 
 
+@register_performance_metric
 def smape(df, w):
     """Symmetric mean absolute percentage error
     based on Chen and Yang (2004) formula
@@ -629,6 +653,7 @@ def smape(df, w):
     Dataframe with columns horizon and smape.
     """
     sape = np.abs(df['y'] - df['yhat']) / ((np.abs(df['y']) + np.abs(df['yhat'])) / 2)
+    sape = sape.fillna(0)
     if w < 0:
         return pd.DataFrame({'horizon': df['horizon'], 'smape': sape})
     return rolling_mean_by_h(
@@ -636,6 +661,7 @@ def smape(df, w):
     )
 
 
+@register_performance_metric
 def coverage(df, w):
     """Coverage
 

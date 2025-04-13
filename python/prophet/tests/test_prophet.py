@@ -36,7 +36,8 @@ class TestProphetFitPredictDefault:
         future = forecaster.make_future_dataframe(test_days, include_history=False)
         future = forecaster.predict(future)
         res = rmse(future["yhat"], test["y"])
-        assert res == pytest.approx(expected, 0.02), "backend: {}".format(forecaster.stan_backend)
+        # Higher threshold due to cmdstan 2.33.1 producing numerical differences for macOS Intel (ARM is fine).
+        assert res == pytest.approx(expected, 0.1), "backend: {}".format(forecaster.stan_backend)
 
     @pytest.mark.parametrize(
         "scaling,expected",
@@ -238,11 +239,21 @@ class TestProphetDataPrep:
         assert len(future) == 3
         assert np.all(future["ds"].values == correct.values)
 
-        future = forecaster.make_future_dataframe(periods=3, freq="M", include_history=False)
+        future = forecaster.make_future_dataframe(periods=3, freq=pd.tseries.offsets.MonthEnd(1), include_history=False)
         correct = pd.DatetimeIndex(["2013-04-30", "2013-05-31", "2013-06-30"])
         assert len(future) == 3
         assert np.all(future["ds"].values == correct.values)
 
+    def test_make_future_dataframe_include_history(self, daily_univariate_ts, backend):
+        train = daily_univariate_ts.head(468 // 2).copy()
+        #cover history with NAs
+        train.loc[train.sample(10).index, "y"] = np.nan
+        
+        forecaster = Prophet(stan_backend=backend)
+        forecaster.fit(train)
+        future = forecaster.make_future_dataframe(periods=3, freq="D", include_history=True)
+
+        assert len(future) == train.shape[0] + 3
 
 class TestProphetTrendComponent:
     def test_invalid_growth_input(self, backend):
@@ -548,6 +559,17 @@ class TestProphetSeasonalComponent:
         assert m.seasonality_mode == "multiplicative"
         with pytest.raises(ValueError):
             Prophet(seasonality_mode="batman", stan_backend=backend)
+
+    def test_set_holidays_mode(self, backend):
+        # Setting attribute
+        m = Prophet(stan_backend=backend)
+        assert m.holidays_mode == "additive"
+        m = Prophet(seasonality_mode="multiplicative", stan_backend=backend)
+        assert m.holidays_mode == "multiplicative"
+        m = Prophet(holidays_mode="multiplicative", stan_backend=backend)
+        assert m.holidays_mode == "multiplicative"
+        with pytest.raises(ValueError):
+            Prophet(holidays_mode="batman", stan_backend=backend)
 
     def test_seasonality_modes(self, daily_univariate_ts, backend):
         # Model with holidays, seasonalities, and extra regressors

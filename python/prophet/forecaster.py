@@ -6,6 +6,7 @@
 
 from __future__ import absolute_import, division, print_function
 
+import dataclasses
 import logging
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
@@ -17,7 +18,7 @@ import pandas as pd
 from numpy.typing import NDArray
 
 from prophet.make_holidays import get_holiday_names, make_holidays_df
-from prophet.models import StanBackendEnum
+from prophet.models import StanBackendEnum, ModelInputData, ModelParams, TrendIndicator
 from prophet.plot import (plot, plot_components)
 
 logger = logging.getLogger('prophet')
@@ -75,6 +76,7 @@ class Prophet(object):
         uncertainty estimation and speed up the calculation.
     stan_backend: str as defined in StanBackendEnum default: None - will try to
         iterate over all available backends and find the working one
+    holidays_mode: 'additive' or 'multiplicative'. Defaults to seasonality_mode.
     """
 
     def __init__(
@@ -96,6 +98,7 @@ class Prophet(object):
             uncertainty_samples=1000,
             stan_backend=None,
             scaling: str = 'absmax',
+            holidays_mode=None,
     ):
         self.growth = growth
 
@@ -115,6 +118,10 @@ class Prophet(object):
         self.holidays = holidays
 
         self.seasonality_mode = seasonality_mode
+        self.holidays_mode = holidays_mode
+        if holidays_mode is None:
+            self.holidays_mode = self.seasonality_mode
+
         self.seasonality_prior_scale = float(seasonality_prior_scale)
         self.changepoint_prior_scale = float(changepoint_prior_scale)
         self.holidays_prior_scale = float(holidays_prior_scale)
@@ -198,6 +205,10 @@ class Prophet(object):
         if self.seasonality_mode not in ['additive', 'multiplicative']:
             raise ValueError(
                 'seasonality_mode must be "additive" or "multiplicative"'
+            )
+        if self.holidays_mode not in ['additive', 'multiplicative']:
+            raise ValueError(
+                'holidays_mode must be "additive" or "multiplicative"'
             )
 
     def validate_column_name(self, name, check_holidays=True,
@@ -309,7 +320,7 @@ class Prophet(object):
 
         if df.index.name == 'ds':
             df.index.name = None
-        df = df.sort_values('ds')
+        df = df.sort_values('ds', kind='mergesort')
         df = df.reset_index(drop=True)
 
         self.initialize_scales(initialize_scales, df)
@@ -445,7 +456,7 @@ class Prophet(object):
         dates: pd.Series,
         period: Union[int, float],
         series_order: int,
-    ) -> NDArray[np.float_]:
+    ) -> NDArray[np.float64]:
         """Provides Fourier series components with the specified frequency
         and order.
 
@@ -817,7 +828,7 @@ class Prophet(object):
             )
             seasonal_features.append(features)
             prior_scales.extend(holiday_priors)
-            modes[self.seasonality_mode].extend(holiday_names)
+            modes[self.holidays_mode].extend(holiday_names)
 
         # Additional regressors
         for name, props in self.extra_regressors.items():
@@ -882,7 +893,7 @@ class Prophet(object):
             modes[mode].append(mode + '_terms')
             modes[mode].append('extra_regressors_' + mode)
         # After all of the additive/multiplicative groups have been added,
-        modes[self.seasonality_mode].append('holidays')
+        modes[self.holidays_mode].append('holidays')
         # Convert to a binary matrix
         component_cols = pd.crosstab(
             components['col'], components['component'],
@@ -1104,6 +1115,76 @@ class Prophet(object):
         m = df['y_scaled'].mean()
         return k, m
 
+    def preprocess(self, df: pd.DataFrame, **kwargs) -> ModelInputData:
+        """
+        Reformats historical data, standardizes y and extra regressors, sets seasonalities and changepoints.
+
+        Saves the preprocessed data to the instantiated object, and also returns the relevant components
+        as a ModelInputData object.
+        """
+        if ('ds' not in df) or ('y' not in df):
+            raise ValueError(
+                'Dataframe must have columns "ds" and "y" with the dates and '
+                'values respectively.'
+            )
+        history = df[df['y'].notnull()].copy()
+        if history.shape[0] < 2:
+            raise ValueError('Dataframe has less than 2 non-NaN rows.')
+        self.history_dates = pd.to_datetime(pd.Series(df['ds'].unique(), name='ds')).sort_values()
+
+        self.history = self.setup_dataframe(history, initialize_scales=True)
+        self.set_auto_seasonalities()
+        seasonal_features, prior_scales, component_cols, modes = (
+            self.make_all_seasonality_features(self.history))
+        self.train_component_cols = component_cols
+        self.component_modes = modes
+        self.fit_kwargs = deepcopy(kwargs)
+
+        self.set_changepoints()
+
+        if self.growth in ['linear', 'flat']:
+            cap = np.zeros(self.history.shape[0])
+        else:
+            cap = self.history['cap_scaled']
+
+        return ModelInputData(
+            T=self.history.shape[0],
+            S=len(self.changepoints_t),
+            K=seasonal_features.shape[1],
+            tau=self.changepoint_prior_scale,
+            trend_indicator=TrendIndicator[self.growth.upper()].value,
+            y=self.history['y_scaled'],
+            t=self.history['t'],
+            t_change=self.changepoints_t,
+            X=seasonal_features,
+            sigmas=prior_scales,
+            s_a=component_cols['additive_terms'],
+            s_m=component_cols['multiplicative_terms'],
+            cap=cap,
+        )
+
+    def calculate_initial_params(self, num_total_regressors: int) -> ModelParams:
+        """
+        Calculates initial parameters for the model based on the preprocessed history.
+
+        Parameters
+        ----------
+        num_total_regressors: the count of seasonality fourier components plus holidays plus extra regressors.
+        """
+        if self.growth == 'linear':
+            k, m = self.linear_growth_init(self.history)
+        elif self.growth == 'flat':
+            k, m = self.flat_growth_init(self.history)
+        elif self.growth == 'logistic':
+            k, m = self.logistic_growth_init(self.history)
+        return ModelParams(
+            k=k,
+            m=m,
+            delta=np.zeros_like(self.changepoints_t),
+            beta=np.zeros(num_total_regressors),
+            sigma_obs=1.0,
+        )
+
     def fit(self, df, **kwargs):
         """Fit the Prophet model.
 
@@ -1132,63 +1213,14 @@ class Prophet(object):
         if self.history is not None:
             raise Exception('Prophet object can only be fit once. '
                             'Instantiate a new object.')
-        if ('ds' not in df) or ('y' not in df):
-            raise ValueError(
-                'Dataframe must have columns "ds" and "y" with the dates and '
-                'values respectively.'
-            )
-        history = df[df['y'].notnull()].copy()
-        if history.shape[0] < 2:
-            raise ValueError('Dataframe has less than 2 non-NaN rows.')
-        self.history_dates = pd.to_datetime(pd.Series(df['ds'].unique(), name='ds')).sort_values()
 
-        history = self.setup_dataframe(history, initialize_scales=True)
-        self.history = history
-        self.set_auto_seasonalities()
-        seasonal_features, prior_scales, component_cols, modes = (
-            self.make_all_seasonality_features(history))
-        self.train_component_cols = component_cols
-        self.component_modes = modes
-        self.fit_kwargs = deepcopy(kwargs)
+        model_inputs = self.preprocess(df, **kwargs)
+        initial_params = self.calculate_initial_params(model_inputs.K)
 
-        self.set_changepoints()
+        dat = dataclasses.asdict(model_inputs)
+        stan_init = dataclasses.asdict(initial_params)
 
-        trend_indicator = {'linear': 0, 'logistic': 1, 'flat': 2}
-
-        dat = {
-            'T': history.shape[0],
-            'K': seasonal_features.shape[1],
-            'S': len(self.changepoints_t),
-            'y': history['y_scaled'],
-            't': history['t'],
-            't_change': self.changepoints_t,
-            'X': seasonal_features,
-            'sigmas': prior_scales,
-            'tau': self.changepoint_prior_scale,
-            'trend_indicator': trend_indicator[self.growth],
-            's_a': component_cols['additive_terms'],
-            's_m': component_cols['multiplicative_terms'],
-        }
-
-        if self.growth == 'linear':
-            dat['cap'] = np.zeros(self.history.shape[0])
-            kinit = self.linear_growth_init(history)
-        elif self.growth == 'flat':
-            dat['cap'] = np.zeros(self.history.shape[0])
-            kinit = self.flat_growth_init(history)
-        else:
-            dat['cap'] = history['cap_scaled']
-            kinit = self.logistic_growth_init(history)
-
-        stan_init = {
-            'k': kinit[0],
-            'm': kinit[1],
-            'delta': np.zeros(len(self.changepoints_t)),
-            'beta': np.zeros(seasonal_features.shape[1]),
-            'sigma_obs': 1,
-        }
-
-        if history['y'].min() == history['y'].max() and \
+        if self.history['y'].min() == self.history['y'].max() and \
                 (self.growth == 'linear' or self.growth == 'flat'):
             self.params = stan_init
             self.params['sigma_obs'] = 1e-9
